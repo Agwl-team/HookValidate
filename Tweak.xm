@@ -1,153 +1,150 @@
 #import <Foundation/Foundation.h>
-#import <zlib.h>
+#import <UIKit/UIKit.h>
+#import <CommonCrypto/CommonCryptor.h>
+#import <substrate.h>
+#import <dlfcn.h>
 
-#pragma mark - gzip 压缩
-NSData *gzipCompress(NSData *data) {
-    if (!data || data.length == 0) return data;
-
-    z_stream strm;
-    memset(&strm, 0, sizeof(strm));
-
-    if (deflateInit2(&strm, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
-        return nil;
-
-    NSMutableData *compressed = [NSMutableData dataWithLength:16384];
-
-    strm.next_in = (Bytef *)data.bytes;
-    strm.avail_in = (uInt)data.length;
-
-    int status;
-    do {
-        if (strm.total_out >= compressed.length)
-            compressed.length += 16384;
-
-        strm.next_out = (Bytef *)compressed.mutableBytes + strm.total_out;
-        strm.avail_out = (uInt)(compressed.length - strm.total_out);
-
-        status = deflate(&strm, Z_FINISH);
-
-    } while (status == Z_OK);
-
-    deflateEnd(&strm);
-
-    if (status != Z_STREAM_END) return nil;
-
-    compressed.length = strm.total_out;
-    return compressed;
-}
-
-#pragma mark - 构造 JSON
-NSData *buildJSON() {
-    long long ts = (long long)([[NSDate date] timeIntervalSince1970] * 1000);
-
-    NSDictionary *obj = @{
-        @"sing": [NSNull null],
-        @"data": [NSNull null],
-        @"code": @0,
-        @"message": @"请求成功",
-        @"success": @YES,
-        @"skey": [NSNull null],
-        @"timestamp": @(ts)
-    };
-
-    return [NSJSONSerialization dataWithJSONObject:obj options:0 error:nil];
-}
-
-#pragma mark - 判断目标请求
-BOOL isTarget(NSURLRequest *req) {
-    return [req.URL.absoluteString containsString:@"wap.jx.10086.cn/nwgt/web/api/v1/menu/validate"];
-}
-
-#pragma mark - 核心 Hook（拦截 Alamofire + NSURLSession）
-%hook NSURLSession
-
-- (NSURLSessionDataTask *)dataTaskWithRequest:(NSURLRequest *)request
-                            completionHandler:(void (^)(NSData *, NSURLResponse *, NSError *))completionHandler {
-
-    if (isTarget(request)) {
-
-        NSLog(@"[Hook] 🎯 命中接口");
-
-        __block void (^origHandler)(NSData *, NSURLResponse *, NSError *) = completionHandler;
-
-        void (^newHandler)(NSData *, NSURLResponse *, NSError *) =
-        ^(NSData *data, NSURLResponse *response, NSError *error) {
-
-            NSData *json = buildJSON();
-            NSData *gzip = gzipCompress(json);
-
-            NSDictionary *headers = @{
-                @"Content-Type": @"application/json;charset=UTF-8",
-                @"Content-Encoding": @"gzip"
-            };
-
-            NSHTTPURLResponse *resp =
-            [[NSHTTPURLResponse alloc] initWithURL:request.URL
-                                        statusCode:200
-                                       HTTPVersion:@"HTTP/1.1"
-                                      headerFields:headers];
-
-            dispatch_async(dispatch_get_main_queue(), ^{
-                origHandler(gzip, resp, nil);
-            });
-        };
-
-        return %orig(request, newHandler); // 确保 task 正常返回
+#pragma mark - HEX工具
+static NSString *hexString(const void *data, size_t len) {
+    if (!data || len == 0) return @"";
+    const unsigned char *p = (const unsigned char *)data;
+    NSMutableString *out = [NSMutableString string];
+    for (int i = 0; i < len; i++) {
+        [out appendFormat:@"%02x", p[i]];
     }
-
-    return %orig(request, completionHandler);
+    return out;
 }
 
-%end
+#pragma mark - 获取当前可用窗口（兼容 iOS 13+）
+static UIWindow *getKeyWindow() {
+    UIApplication *app = [UIApplication sharedApplication];
 
-#pragma mark - SSL 绕过（不影响证书验证）
-- (void)URLSession:(NSURLSession *)session
-        didReceiveChallenge:(NSURLAuthenticationChallenge *)challenge
-          completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler {
-
-    if ([challenge.protectionSpace.authenticationMethod isEqualToString:NSURLAuthenticationMethodServerTrust]) {
-        NSURLCredential *cred =
-        [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust];
-        completionHandler(NSURLSessionAuthChallengeUseCredential, cred);
-        return;
-    }
-
-    %orig(session, challenge, completionHandler);
-}
-
-%end
-
-#pragma mark - NSURLSessionTask delegate Hook（兼容 Alamofire delegate）
-%hook NSURLSessionTask
-
-- (void)setState:(NSURLSessionTaskState)state {
-    %orig;
-
-    if (state == NSURLSessionTaskStateCompleted) {
-        NSURLRequest *req = self.currentRequest;
-        if (!isTarget(req)) return;
-
-        NSData *jsonData = buildJSON();
-        NSData *gzipData = gzipCompress(jsonData);
-
-        if ([self respondsToSelector:@selector(setValue:forKey:)]) {
-            @try {
-                [self setValue:gzipData forKey:@"_responseData"];
-            } @catch (NSException *exception) {
-                NSLog(@"[Hook] KVC _responseData failed: %@", exception);
+    for (UIWindowScene *scene in app.connectedScenes) {
+        if (scene.activationState == UISceneActivationStateForegroundActive) {
+            for (UIWindow *window in scene.windows) {
+                if (window.isKeyWindow) {
+                    return window;
+                }
             }
         }
     }
+    return nil;
 }
 
-%end
+#pragma mark - 弹窗
+static void showAlert(NSString *title, NSString *msg) {
+    dispatch_async(dispatch_get_main_queue(), ^{
 
-#pragma mark - NSURLConnection Hook（兼容旧版网络库）
-%hook NSURLConnection
+        UIWindow *window = getKeyWindow();
+        if (!window) return;
 
-+ (BOOL)canHandleRequest:(NSURLRequest *)request {
-    if (isTarget(request)) return YES;
-    return %orig;
+        UIViewController *root = window.rootViewController;
+        if (!root) return;
+
+        while (root.presentedViewController) {
+            root = root.presentedViewController;
+        }
+
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:nil]];
+
+        [root presentViewController:alert animated:YES completion:nil];
+    });
 }
 
-%end
+#pragma mark - 原函数
+static CCCryptorStatus (*orig_CCCrypt)(
+    CCOperation op,
+    CCAlgorithm alg,
+    CCOptions options,
+    const void *key,
+    size_t keyLength,
+    const void *iv,
+    const void *dataIn,
+    size_t dataInLength,
+    void *dataOut,
+    size_t dataOutAvailable,
+    size_t *dataOutMoved
+);
+
+#pragma mark - 限流控制
+static int dumpCount = 0;
+static BOOL alertShown = NO;
+
+#pragma mark - Hook函数
+CCCryptorStatus hook_CCCrypt(
+    CCOperation op,
+    CCAlgorithm alg,
+    CCOptions options,
+    const void *key,
+    size_t keyLength,
+    const void *iv,
+    const void *dataIn,
+    size_t dataInLength,
+    void *dataOut,
+    size_t dataOutAvailable,
+    size_t *dataOutMoved
+) {
+
+    if (alg == kCCAlgorithmAES) {
+
+        // 限制最多打印 10 次（防止卡死）
+        if (dumpCount++ < 10) {
+
+            NSString *type = (op == kCCEncrypt) ? @"Encrypt" : @"Decrypt";
+            NSString *keyHex = hexString(key, keyLength);
+            NSString *ivHex  = iv ? hexString(iv, 16) : @"NULL";
+
+            NSString *msg = [NSString stringWithFormat:
+                @"AES %@\n\nKEY:\n%@\n\nIV:\n%@",
+                type, keyHex, ivHex
+            ];
+
+            NSLog(@"%@", msg);
+
+            // 写文件
+            NSString *path = @"/var/mobile/aes_dump.log";
+            NSString *old = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+            NSString *newLog = old ? [old stringByAppendingFormat:@"\n%@\n", msg] : msg;
+            [newLog writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+            // 只弹一次
+            if (!alertShown) {
+                alertShown = YES;
+                showAlert(@"AES Dump", msg);
+            }
+        }
+    }
+
+    return orig_CCCrypt(op, alg, options, key, keyLength, iv,
+                       dataIn, dataInLength,
+                       dataOut, dataOutAvailable, dataOutMoved);
+}
+
+#pragma mark - 初始化
+__attribute__((constructor))
+static void init() {
+
+    NSLog(@"[*] AES Dump dylib Loaded");
+
+    void *handle = dlopen("/usr/lib/system/libcommonCrypto.dylib", RTLD_NOW);
+
+    if (!handle) {
+        NSLog(@"[-] Failed to load CommonCrypto");
+        return;
+    }
+
+    void *cccrypt = dlsym(handle, "CCCrypt");
+
+    if (cccrypt) {
+        MSHookFunction(cccrypt, (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+        NSLog(@"[+] Hook CCCrypt success");
+    } else {
+        NSLog(@"[-] CCCrypt not found");
+    }
+}
