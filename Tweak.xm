@@ -4,10 +4,10 @@
 #import <substrate.h>
 #import <dlfcn.h>
 
-#pragma mark - HEX工具
+#pragma mark - HEX
 static NSString *hexString(const void *data, size_t len) {
     if (!data || len == 0) return @"";
-    const unsigned char *p = (const unsigned char *)data;
+    const unsigned char *p = data;
     NSMutableString *out = [NSMutableString string];
     for (int i = 0; i < len; i++) {
         [out appendFormat:@"%02x", p[i]];
@@ -15,37 +15,43 @@ static NSString *hexString(const void *data, size_t len) {
     return out;
 }
 
-#pragma mark - 获取当前可用窗口（兼容 iOS 13+）
-static UIWindow *getKeyWindow() {
-    UIApplication *app = [UIApplication sharedApplication];
+#pragma mark - 安全获取VC
+static UIViewController *getTopVC() {
+    UIWindow *window = nil;
 
-    for (UIWindowScene *scene in app.connectedScenes) {
+    for (UIWindowScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (scene.activationState == UISceneActivationStateForegroundActive) {
-            for (UIWindow *window in scene.windows) {
-                if (window.isKeyWindow) {
-                    return window;
+            for (UIWindow *w in scene.windows) {
+                if (w.isKeyWindow) {
+                    window = w;
+                    break;
                 }
             }
         }
+        if (window) break;
     }
-    return nil;
+
+    if (!window) return nil;
+
+    UIViewController *root = window.rootViewController;
+    if (!root) return nil;
+
+    while (root.presentedViewController) {
+        root = root.presentedViewController;
+    }
+
+    return root;
 }
 
-#pragma mark - 弹窗
-static void showAlert(NSString *title, NSString *msg) {
+#pragma mark - 安全弹窗（不会崩）
+static void safeAlert(NSString *msg) {
+
     dispatch_async(dispatch_get_main_queue(), ^{
 
-        UIWindow *window = getKeyWindow();
-        if (!window) return;
+        UIViewController *vc = getTopVC();
+        if (!vc) return; // ❗关键：不强行弹
 
-        UIViewController *root = window.rootViewController;
-        if (!root) return;
-
-        while (root.presentedViewController) {
-            root = root.presentedViewController;
-        }
-
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:title
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"AES Dump"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
 
@@ -53,7 +59,7 @@ static void showAlert(NSString *title, NSString *msg) {
                                                   style:UIAlertActionStyleDefault
                                                 handler:nil]];
 
-        [root presentViewController:alert animated:YES completion:nil];
+        [vc presentViewController:alert animated:YES completion:nil];
     });
 }
 
@@ -72,11 +78,10 @@ static CCCryptorStatus (*orig_CCCrypt)(
     size_t *dataOutMoved
 );
 
-#pragma mark - 限流控制
 static int dumpCount = 0;
-static BOOL alertShown = NO;
+static BOOL shown = NO;
 
-#pragma mark - Hook函数
+#pragma mark - Hook
 CCCryptorStatus hook_CCCrypt(
     CCOperation op,
     CCAlgorithm alg,
@@ -93,30 +98,32 @@ CCCryptorStatus hook_CCCrypt(
 
     if (alg == kCCAlgorithmAES) {
 
-        // 限制最多打印 10 次（防止卡死）
-        if (dumpCount++ < 10) {
-
-            NSString *type = (op == kCCEncrypt) ? @"Encrypt" : @"Decrypt";
-            NSString *keyHex = hexString(key, keyLength);
-            NSString *ivHex  = iv ? hexString(iv, 16) : @"NULL";
+        if (dumpCount++ < 5) {
 
             NSString *msg = [NSString stringWithFormat:
-                @"AES %@\n\nKEY:\n%@\n\nIV:\n%@",
-                type, keyHex, ivHex
+                @"AES %s\n\nKEY:\n%@\n\nIV:\n%@",
+                op == kCCEncrypt ? "Encrypt" : "Decrypt",
+                hexString(key, keyLength),
+                iv ? hexString(iv, 16) : @"NULL"
             ];
 
             NSLog(@"%@", msg);
 
-            // 写文件
-            NSString *path = @"/var/mobile/aes_dump.log";
-            NSString *old = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
-            NSString *newLog = old ? [old stringByAppendingFormat:@"\n%@\n", msg] : msg;
-            [newLog writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            // 写文件（最稳）
+            NSString *path = @"/var/mobile/aes.log";
+            NSFileHandle *file = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (!file) {
+                [msg writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            } else {
+                [file seekToEndOfFile];
+                [file writeData:[[msg stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
+                [file closeFile];
+            }
 
-            // 只弹一次
-            if (!alertShown) {
-                alertShown = YES;
-                showAlert(@"AES Dump", msg);
+            // ❗只在 UI 准备好时弹一次
+            if (!shown) {
+                shown = YES;
+                safeAlert(msg);
             }
         }
     }
@@ -126,25 +133,28 @@ CCCryptorStatus hook_CCCrypt(
                        dataOut, dataOutAvailable, dataOutMoved);
 }
 
-#pragma mark - 初始化
+#pragma mark - 延迟 Hook（关键）
+static void hookCrypto() {
+
+    void *handle = dlopen("/usr/lib/system/libcommonCrypto.dylib", RTLD_NOW);
+    if (!handle) return;
+
+    void *sym = dlsym(handle, "CCCrypt");
+    if (sym) {
+        MSHookFunction(sym, (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
+        NSLog(@"[+] CCCrypt Hooked");
+    }
+}
+
+#pragma mark - 延迟初始化（避免闪退）
 __attribute__((constructor))
 static void init() {
 
-    NSLog(@"[*] AES Dump dylib Loaded");
+    NSLog(@"[*] AES Dump Loaded");
 
-    void *handle = dlopen("/usr/lib/system/libcommonCrypto.dylib", RTLD_NOW);
-
-    if (!handle) {
-        NSLog(@"[-] Failed to load CommonCrypto");
-        return;
-    }
-
-    void *cccrypt = dlsym(handle, "CCCrypt");
-
-    if (cccrypt) {
-        MSHookFunction(cccrypt, (void *)hook_CCCrypt, (void **)&orig_CCCrypt);
-        NSLog(@"[+] Hook CCCrypt success");
-    } else {
-        NSLog(@"[-] CCCrypt not found");
-    }
+    // ❗延迟 3 秒再 Hook（关键）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
+                   dispatch_get_main_queue(), ^{
+        hookCrypto();
+    });
 }
